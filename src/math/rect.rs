@@ -74,10 +74,10 @@ impl Rect {
 
     /// Checks whether the `Rect` overlaps another `Rect`
     pub fn overlaps(&self, other: &Rect) -> bool {
-        self.left() <= other.right()
-            && self.right() >= other.left()
-            && self.top() <= other.bottom()
-            && self.bottom() >= other.top()
+        self.left() < other.right()
+            && self.right() > other.left()
+            && self.top() < other.bottom()
+            && self.bottom() > other.top()
     }
 
     /// Returns a new `Rect` that includes all points of these two `Rect`s.
