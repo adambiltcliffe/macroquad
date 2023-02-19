@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{
     color::Color,
-    get_context,
+    get_context, get_quad_context,
     math::{vec3, Rect},
     texture::Image,
 };
@@ -131,6 +131,9 @@ impl FontInternal {
         font_scale_x: f32,
         font_scale_y: f32,
     ) -> TextDimensions {
+        let dpi_scaling = get_quad_context().dpi_scale();
+        let font_size = (font_size as f32 * dpi_scaling).ceil() as u16;
+
         for character in text.chars() {
             if self.characters.contains_key(&(character, font_size)) == false {
                 self.cache_glyph(character, font_size);
@@ -161,9 +164,9 @@ impl FontInternal {
 
         let height = max_y - min_y;
         TextDimensions {
-            width,
-            height: height,
-            offset_y: max_y,
+            width: width / dpi_scaling,
+            height: height / dpi_scaling,
+            offset_y: max_y / dpi_scaling,
         }
     }
 }
@@ -219,6 +222,9 @@ pub struct TextParams {
     /// and Y axis would be scaled by font_scale
     /// Default is 1.0
     pub font_scale_aspect: f32,
+    /// Text rotation in radian
+    /// Default is 0.0
+    pub rotation: f32,
     pub color: Color,
 }
 
@@ -230,13 +236,16 @@ impl Default for TextParams {
             font_scale: 1.0,
             font_scale_aspect: 1.0,
             color: WHITE,
+            rotation: 0.0,
         }
     }
 }
 
 /// Load font from file with "path"
 pub async fn load_ttf_font(path: &str) -> Result<Font, FontError> {
-    let bytes = crate::file::load_file(path).await.unwrap();
+    let bytes = crate::file::load_file(path)
+        .await
+        .map_err(|_| "The Font file couldn't be loaded")?;
 
     load_ttf_font_from_bytes(&bytes[..])
 }
@@ -248,7 +257,7 @@ pub async fn load_ttf_font(path: &str) -> Result<Font, FontError> {
 pub fn load_ttf_font_from_bytes(bytes: &[u8]) -> Result<Font, FontError> {
     let context = get_context();
     let atlas = Rc::new(RefCell::new(Atlas::new(
-        &mut get_context().quad_context,
+        get_quad_context(),
         miniquad::FilterMode::Linear,
     )));
 
@@ -282,21 +291,25 @@ pub fn draw_text_ex(text: &str, x: f32, y: f32, params: TextParams) {
 
     let font_scale_x = params.font_scale * params.font_scale_aspect;
     let font_scale_y = params.font_scale;
-    let dpi_scaling = get_context().quad_context.dpi_scale();
+    let dpi_scaling = get_quad_context().dpi_scale();
 
-    let font_size = params.font_size * dpi_scaling.ceil() as u16;
+    let font_size = (params.font_size as f32 * dpi_scaling).ceil() as u16;
 
     let mut total_width = 0.;
     for character in text.chars() {
-        if font.characters.contains_key(&(character, font_size)) == false {
+        if !font.characters.contains_key(&(character, font_size)) {
             font.cache_glyph(character, font_size);
         }
         let mut atlas = font.atlas.borrow_mut();
         let font_data = &font.characters[&(character, font_size)];
         let glyph = atlas.get(font_data.sprite).unwrap().rect;
-        let left_coord = font_data.offset_x as f32 * font_scale_x + total_width;
-        let top_coord =
-            0.0 - glyph.h as f32 * font_scale_y - font_data.offset_y as f32 * font_scale_y;
+        let angle_rad = params.rotation;
+        let left_coord = (font_data.offset_x as f32 * font_scale_x + total_width) * angle_rad.cos()
+            + (glyph.h as f32 * font_scale_y + font_data.offset_y as f32 * font_scale_y)
+                * angle_rad.sin();
+        let top_coord = (font_data.offset_x as f32 * font_scale_x + total_width) * angle_rad.sin()
+            + (0.0 - glyph.h as f32 * font_scale_y - font_data.offset_y as f32 * font_scale_y)
+                * angle_rad.cos();
 
         total_width += font_data.advance * font_scale_x;
 
@@ -322,13 +335,32 @@ pub fn draw_text_ex(text: &str, x: f32, y: f32, params: TextParams) {
             crate::texture::DrawTextureParams {
                 dest_size: Some(vec2(dest.w, dest.h)),
                 source: Some(source),
+                rotation: angle_rad,
+                pivot: Option::Some(vec2(dest.x, dest.y)),
                 ..Default::default()
             },
         );
     }
 }
 
+/// Get the text center.
+pub fn get_text_center(
+    text: &str,
+    font: Option<Font>,
+    font_size: u16,
+    font_scale: f32,
+    rotation: f32,
+) -> crate::Vec2 {
+    let measure = measure_text(text, font, font_size, font_scale);
+
+    let x_center = measure.width / 2.0 * rotation.cos() + measure.height / 2.0 * rotation.sin();
+    let y_center = measure.width / 2.0 * rotation.sin() - measure.height / 2.0 * rotation.cos();
+
+    crate::Vec2::new(x_center, y_center)
+}
+
 /// World space dimensions of the text, measured by "measure_text" function
+#[derive(Debug, Clone, Copy)]
 pub struct TextDimensions {
     /// Distance from very left to very right of the rasterized text
     pub width: f32,
@@ -384,7 +416,7 @@ impl FontsStorage {
 /// looks good in currently active camera
 pub fn camera_font_scale(world_font_size: f32) -> (u16, f32, f32) {
     let context = get_context();
-    let (scr_w, scr_h) = context.quad_context.screen_size();
+    let (scr_w, scr_h) = get_quad_context().screen_size();
     let cam_space = context
         .projection_matrix()
         .inverse()

@@ -122,7 +122,7 @@ pub use macroquad_macro::main;
 ///
 /// Very similar to macroquad::main
 /// Right now it will still spawn a window, just like ::main, therefore
-/// is not really usefull for anything than developping macroquad itself
+/// is not really useful for anything than developping macroquad itself
 #[doc(hidden)]
 pub use macroquad_macro::test;
 
@@ -150,7 +150,6 @@ use crate::{
 use glam::{vec2, Mat4, Vec2};
 
 struct Context {
-    quad_context: QuadContext,
     audio_context: audio::AudioContext,
 
     screen_width: f32,
@@ -268,7 +267,7 @@ impl MiniquadInputEvent {
 impl Context {
     const DEFAULT_BG_COLOR: Color = BLACK;
 
-    fn new(mut ctx: QuadContext) -> Context {
+    fn new(ctx: &mut QuadContext) -> Context {
         let (screen_width, screen_height) = ctx.screen_size();
 
         Context {
@@ -297,14 +296,13 @@ impl Context {
             input_events: Vec::new(),
 
             camera_matrix: None,
-            gl: QuadGl::new(&mut ctx),
+            gl: QuadGl::new(ctx),
 
-            ui_context: UiContext::new(&mut ctx, screen_width, screen_height),
-            fonts_storage: text::FontsStorage::new(&mut ctx),
-            texture_batcher: texture::Batcher::new(&mut ctx),
+            ui_context: UiContext::new(ctx, screen_width, screen_height),
+            fonts_storage: text::FontsStorage::new(ctx),
+            texture_batcher: texture::Batcher::new(ctx),
             camera_stack: vec![],
 
-            quad_context: ctx,
             audio_context: audio::AudioContext::new(),
             coroutines_context: experimental::coroutines::CoroutinesContext::new(),
 
@@ -325,7 +323,11 @@ impl Context {
         telemetry::begin_gpu_query("GPU");
 
         self.ui_context.process_input();
-        self.clear(Self::DEFAULT_BG_COLOR);
+
+        let color = Self::DEFAULT_BG_COLOR;
+
+        get_quad_context().clear(Some((color.r, color.g, color.b, color.a)), None, None);
+        self.gl.reset();
     }
 
     fn end_frame(&mut self) {
@@ -333,11 +335,11 @@ impl Context {
 
         self.perform_render_passes();
 
-        self.ui_context.draw(&mut self.quad_context, &mut self.gl);
+        self.ui_context.draw(get_quad_context(), &mut self.gl);
         let screen_mat = self.pixel_perfect_projection_matrix();
-        self.gl.draw(&mut self.quad_context, screen_mat);
+        self.gl.draw(get_quad_context(), screen_mat);
 
-        self.quad_context.commit_frame();
+        get_quad_context().commit_frame();
 
         #[cfg(one_screenshot)]
         {
@@ -372,15 +374,10 @@ impl Context {
         }
     }
 
-    fn clear(&mut self, color: Color) {
-        self.quad_context
-            .clear(Some((color.r, color.g, color.b, color.a)), None, None);
-        self.gl.reset();
-    }
-
     pub(crate) fn pixel_perfect_projection_matrix(&self) -> glam::Mat4 {
-        let (width, height) = self.quad_context.screen_size();
-        let dpi = self.quad_context.dpi_scale();
+        let (width, height) = get_quad_context().screen_size();
+
+        let dpi = get_quad_context().dpi_scale();
 
         glam::Mat4::orthographic_rh_gl(0., width / dpi, height / dpi, 0., -1., 1.)
     }
@@ -396,13 +393,23 @@ impl Context {
     pub(crate) fn perform_render_passes(&mut self) {
         let matrix = self.projection_matrix();
 
-        self.gl.draw(&mut self.quad_context, matrix);
+        self.gl.draw(&mut get_quad_context(), matrix);
     }
 }
 
 #[no_mangle]
 static mut CONTEXT: Option<Context> = None;
 
+static mut QUAD_CONTEXT: *mut miniquad::Context = std::ptr::null_mut();
+
+// this is very very bad
+// trust me, macroquad will get rid of this!
+fn set_quad_context(ctx: &mut miniquad::Context) {
+    unsafe { QUAD_CONTEXT = std::mem::transmute(ctx) };
+}
+
+// This is required for #[macroquad::test]
+//
 // unfortunately #[cfg(test)] do not work with integration tests
 // so this module should be publicly available
 #[doc(hidden)]
@@ -415,18 +422,28 @@ fn get_context() -> &'static mut Context {
     unsafe { CONTEXT.as_mut().unwrap_or_else(|| panic!()) }
 }
 
+fn get_quad_context() -> &'static mut QuadContext {
+    unsafe {
+        assert!(!QUAD_CONTEXT.is_null());
+    }
+
+    unsafe { &mut *QUAD_CONTEXT }
+}
+
 static mut MAIN_FUTURE: Option<Pin<Box<dyn Future<Output = ()>>>> = None;
 
 struct Stage {}
 
-impl EventHandlerFree for Stage {
-    fn resize_event(&mut self, width: f32, height: f32) {
+impl EventHandler for Stage {
+    fn resize_event(&mut self, ctx: &mut miniquad::Context, width: f32, height: f32) {
+        set_quad_context(ctx);
+
         let _z = telemetry::ZoneGuard::new("Event::resize_event");
         get_context().screen_width = width;
         get_context().screen_height = height;
     }
 
-    fn raw_mouse_motion(&mut self, x: f32, y: f32) {
+    fn raw_mouse_motion(&mut self, _: &mut miniquad::Context, x: f32, y: f32) {
         let context = get_context();
 
         if context.cursor_grabbed {
@@ -443,7 +460,7 @@ impl EventHandlerFree for Stage {
         }
     }
 
-    fn mouse_motion_event(&mut self, x: f32, y: f32) {
+    fn mouse_motion_event(&mut self, _: &mut miniquad::Context, x: f32, y: f32) {
         let context = get_context();
 
         if !context.cursor_grabbed {
@@ -456,7 +473,7 @@ impl EventHandlerFree for Stage {
         }
     }
 
-    fn mouse_wheel_event(&mut self, x: f32, y: f32) {
+    fn mouse_wheel_event(&mut self, _: &mut miniquad::Context, x: f32, y: f32) {
         let context = get_context();
 
         context.mouse_wheel.x = x;
@@ -468,39 +485,58 @@ impl EventHandlerFree for Stage {
             .for_each(|arr| arr.push(MiniquadInputEvent::MouseWheel { x, y }));
     }
 
-    fn mouse_button_down_event(&mut self, btn: MouseButton, x: f32, y: f32) {
+    fn mouse_button_down_event(
+        &mut self,
+        _: &mut miniquad::Context,
+        btn: MouseButton,
+        x: f32,
+        y: f32,
+    ) {
         let context = get_context();
 
         context.mouse_down.insert(btn);
         context.mouse_pressed.insert(btn);
 
+        context
+            .input_events
+            .iter_mut()
+            .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonDown { x, y, btn }));
+
         if !context.cursor_grabbed {
             context.mouse_position = Vec2::new(x, y);
-
-            context
-                .input_events
-                .iter_mut()
-                .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonDown { x, y, btn }));
         }
     }
 
-    fn mouse_button_up_event(&mut self, btn: MouseButton, x: f32, y: f32) {
+    fn mouse_button_up_event(
+        &mut self,
+        _: &mut miniquad::Context,
+        btn: MouseButton,
+        x: f32,
+        y: f32,
+    ) {
         let context = get_context();
 
         context.mouse_down.remove(&btn);
         context.mouse_released.insert(btn);
 
+        context
+            .input_events
+            .iter_mut()
+            .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonUp { x, y, btn }));
+
         if !context.cursor_grabbed {
             context.mouse_position = Vec2::new(x, y);
-
-            context
-                .input_events
-                .iter_mut()
-                .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonUp { x, y, btn }));
         }
     }
 
-    fn touch_event(&mut self, phase: TouchPhase, id: u64, x: f32, y: f32) {
+    fn touch_event(
+        &mut self,
+        ctx: &mut miniquad::Context,
+        phase: TouchPhase,
+        id: u64,
+        x: f32,
+        y: f32,
+    ) {
         let context = get_context();
 
         context.touches.insert(
@@ -514,15 +550,15 @@ impl EventHandlerFree for Stage {
 
         if context.simulate_mouse_with_touch {
             if phase == TouchPhase::Started {
-                self.mouse_button_down_event(MouseButton::Left, x, y);
+                self.mouse_button_down_event(ctx, MouseButton::Left, x, y);
             }
 
             if phase == TouchPhase::Ended {
-                self.mouse_button_up_event(MouseButton::Left, x, y);
+                self.mouse_button_up_event(ctx, MouseButton::Left, x, y);
             }
 
             if phase == TouchPhase::Moved {
-                self.mouse_motion_event(x, y);
+                self.mouse_motion_event(ctx, x, y);
             }
         };
 
@@ -532,7 +568,13 @@ impl EventHandlerFree for Stage {
             .for_each(|arr| arr.push(MiniquadInputEvent::Touch { phase, id, x, y }));
     }
 
-    fn char_event(&mut self, character: char, modifiers: KeyMods, repeat: bool) {
+    fn char_event(
+        &mut self,
+        _: &mut miniquad::Context,
+        character: char,
+        modifiers: KeyMods,
+        repeat: bool,
+    ) {
         let context = get_context();
 
         context.chars_pressed_queue.push(character);
@@ -547,7 +589,13 @@ impl EventHandlerFree for Stage {
         });
     }
 
-    fn key_down_event(&mut self, keycode: KeyCode, modifiers: KeyMods, repeat: bool) {
+    fn key_down_event(
+        &mut self,
+        _: &mut miniquad::Context,
+        keycode: KeyCode,
+        modifiers: KeyMods,
+        repeat: bool,
+    ) {
         let context = get_context();
         context.keys_down.insert(keycode);
         if repeat == false {
@@ -563,7 +611,7 @@ impl EventHandlerFree for Stage {
         });
     }
 
-    fn key_up_event(&mut self, keycode: KeyCode, modifiers: KeyMods) {
+    fn key_up_event(&mut self, _: &mut miniquad::Context, keycode: KeyCode, modifiers: KeyMods) {
         let context = get_context();
         context.keys_down.remove(&keycode);
         context.keys_released.insert(keycode);
@@ -574,12 +622,12 @@ impl EventHandlerFree for Stage {
             .for_each(|arr| arr.push(MiniquadInputEvent::KeyUp { keycode, modifiers }));
     }
 
-    fn update(&mut self) {
+    fn update(&mut self, ctx: &mut miniquad::Context) {
+        set_quad_context(ctx);
         let _z = telemetry::ZoneGuard::new("Event::update");
 
         // Unless called every frame, cursor will not remain grabbed
-        let context = get_context();
-        context.quad_context.set_cursor_grab(context.cursor_grabbed);
+        get_quad_context().set_cursor_grab(get_context().cursor_grabbed);
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -588,7 +636,8 @@ impl EventHandlerFree for Stage {
         }
     }
 
-    fn draw(&mut self) {
+    fn draw(&mut self, ctx: &mut miniquad::Context) {
+        set_quad_context(ctx);
         {
             let _z = telemetry::ZoneGuard::new("Event::draw");
 
@@ -612,11 +661,11 @@ impl EventHandlerFree for Stage {
                 if let Some(future) = unsafe { MAIN_FUTURE.as_mut() } {
                     let _z = telemetry::ZoneGuard::new("Event::draw user code");
 
-                    if exec::resume(future) {
+                    if exec::resume(future).is_some() {
                         unsafe {
                             MAIN_FUTURE = None;
                         }
-                        get_context().quad_context.quit();
+                        get_quad_context().quit();
                         return;
                     }
                     get_context().coroutines_context.update();
@@ -652,20 +701,20 @@ impl EventHandlerFree for Stage {
         telemetry::reset();
     }
 
-    fn window_restored_event(&mut self) {
+    fn window_restored_event(&mut self, _: &mut miniquad::Context) {
         #[cfg(target_os = "android")]
         get_context().audio_context.resume();
     }
 
-    fn window_minimized_event(&mut self) {
+    fn window_minimized_event(&mut self, _: &mut miniquad::Context) {
         #[cfg(target_os = "android")]
         get_context().audio_context.pause();
     }
 
-    fn quit_requested_event(&mut self) {
+    fn quit_requested_event(&mut self, ctx: &mut miniquad::Context) {
         let context = get_context();
         if context.prevent_quit_event {
-            context.quad_context.cancel_quit();
+            ctx.cancel_quit();
             context.quit_requested = true;
         }
     }
@@ -699,7 +748,7 @@ impl Window {
                     MAIN_FUTURE = Some(Box::pin(future));
                 }
                 unsafe { CONTEXT = Some(Context::new(ctx)) };
-                UserData::free(Stage {})
+                Box::new(Stage {})
             },
         );
     }

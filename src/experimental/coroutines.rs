@@ -3,21 +3,58 @@
 //! some evaluation over time.
 //!
 
+use std::any::{Any, TypeId};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::exec::resume;
 use crate::get_context;
 
+mod generational_storage;
+
+use generational_storage::{GenerationalId, GenerationalStorage};
+
 struct CoroutineInternal {
-    future: Pin<Box<dyn Future<Output = ()>>>,
+    future: Pin<Box<dyn Future<Output = Box<dyn Any>>>>,
     manual_poll: bool,
     manual_time: Option<f64>,
+    // if return value of a coroutine is () there is no need to
+    // keep coroutine's memory allocated until the user retrieves the data
+    // we can free the memory right away, and just return () on retrieve
+    has_value: bool,
+}
+
+enum CoroutineState {
+    Running(CoroutineInternal),
+    Value(Box<dyn Any>),
+    Nothing,
+}
+
+impl CoroutineState {
+    pub fn is_value(&self) -> bool {
+        matches!(self, CoroutineState::Value(_))
+    }
+
+    pub fn is_nothing(&self) -> bool {
+        matches!(self, CoroutineState::Nothing)
+    }
+
+    pub fn take_value(&mut self) -> Option<Box<dyn Any>> {
+        if self.is_value() {
+            let state = std::mem::replace(self, CoroutineState::Nothing);
+            if let CoroutineState::Value(v) = state {
+                return Some(v);
+            }
+        }
+
+        None
+    }
 }
 
 pub(crate) struct CoroutinesContext {
-    coroutines: Vec<Option<CoroutineInternal>>,
+    coroutines: GenerationalStorage<CoroutineState>,
     active_coroutine_now: Option<f64>,
     active_coroutine_delta: Option<f64>,
 }
@@ -25,32 +62,77 @@ pub(crate) struct CoroutinesContext {
 impl CoroutinesContext {
     pub fn new() -> CoroutinesContext {
         CoroutinesContext {
-            coroutines: Vec::with_capacity(1000),
+            coroutines: GenerationalStorage::new(),
             active_coroutine_now: None,
             active_coroutine_delta: None,
         }
     }
 
     pub fn update(&mut self) {
-        for future in &mut self.coroutines {
-            if let Some(f) = future {
-                if f.manual_poll == false && resume(&mut f.future) {
-                    *future = None;
+        self.coroutines.retain(|coroutine| {
+            if let CoroutineState::Running(ref mut f) = coroutine {
+                if f.manual_poll == false {
+                    if let Some(v) = resume(&mut f.future) {
+                        if f.has_value {
+                            *coroutine = CoroutineState::Value(v);
+                        } else {
+                            return false;
+                        }
+                    }
                 }
             }
-        }
+
+            true
+        });
+    }
+
+    pub(crate) fn allocated_memory(&self) -> usize {
+        self.coroutines.allocated_memory()
+    }
+
+    pub(crate) fn active_coroutines_count(&self) -> usize {
+        self.coroutines.count()
     }
 }
 #[derive(Clone, Copy, Debug)]
-pub struct Coroutine {
-    id: usize,
+pub struct Coroutine<T = ()> {
+    id: GenerationalId,
+    _phantom: PhantomData<T>,
 }
 
-impl Coroutine {
+impl<T: 'static + Any> Coroutine<T> {
+    /// Returns true if the coroutine finished or was stopped.
     pub fn is_done(&self) -> bool {
         let context = &get_context().coroutines_context;
 
-        context.coroutines[self.id].is_none()
+        let coroutine = context.coroutines.get(self.id);
+
+        if let Some(coroutine) = coroutine {
+            return coroutine.is_value() || coroutine.is_nothing();
+        }
+
+        return true;
+    }
+
+    pub fn retrieve(&self) -> Option<T> {
+        let context = &mut get_context().coroutines_context;
+
+        // () is a special case. Futures with () as a return type do not keep
+        // their state after finish, so just return ()
+        if self.is_done() && TypeId::of::<()>() == TypeId::of::<T>() {
+            // well, I wish tehre was a better way to do this..
+            let res = Box::new(()) as Box<dyn Any>;
+            return Some(*res.downcast().unwrap());
+        }
+
+        let coroutine = context.coroutines.get_mut(self.id);
+        if let Some(v) = coroutine.and_then(|c| c.take_value()) {
+            let res = Some(*v.downcast().unwrap());
+            context.coroutines.free(self.id);
+            return res;
+        }
+
+        None
     }
 
     /// By default coroutines are being polled each frame, inside the "next_frame()"
@@ -80,7 +162,7 @@ impl Coroutine {
     pub fn set_manual_poll(&mut self) {
         let context = &mut get_context().coroutines_context;
 
-        if let Some(coroutine) = &mut context.coroutines[self.id] {
+        if let Some(CoroutineState::Running(coroutine)) = context.coroutines.get_mut(self.id) {
             coroutine.manual_time = Some(0.);
             coroutine.manual_poll = true;
         }
@@ -92,13 +174,24 @@ impl Coroutine {
     pub fn poll(&mut self, delta_time: f64) {
         let context = &mut get_context().coroutines_context;
 
-        let coroutine = &mut context.coroutines[self.id];
-        if let Some(f) = coroutine {
+        let coroutine = context.coroutines.get_mut(self.id);
+
+        // coroutine was finished already
+        if coroutine.is_none() {
+            return;
+        }
+
+        let coroutine = coroutine.unwrap();
+        if let CoroutineState::Running(f) = coroutine {
             context.active_coroutine_now = f.manual_time;
             context.active_coroutine_delta = Some(delta_time);
             *f.manual_time.as_mut().unwrap() += delta_time;
-            if resume(&mut f.future) {
-                *coroutine = None;
+            if let Some(v) = resume(&mut f.future) {
+                if f.has_value {
+                    *coroutine = CoroutineState::Value(v);
+                } else {
+                    context.coroutines.free(self.id);
+                }
             }
             context.active_coroutine_now = None;
             context.active_coroutine_delta = None;
@@ -106,37 +199,38 @@ impl Coroutine {
     }
 }
 
-pub fn start_coroutine(future: impl Future<Output = ()> + 'static + Send) -> Coroutine {
+pub fn start_coroutine<T: 'static + Any>(
+    future: impl Future<Output = T> + 'static + Send,
+) -> Coroutine<T> {
     let context = &mut get_context().coroutines_context;
 
-    let boxed_future: Pin<Box<dyn Future<Output = ()>>> = Box::pin(future);
+    let has_value = TypeId::of::<()>() != TypeId::of::<T>();
 
-    context.coroutines.push(Some(CoroutineInternal {
-        future: boxed_future,
-        manual_poll: false,
-        manual_time: None,
-    }));
+    let id = context
+        .coroutines
+        .push(CoroutineState::Running(CoroutineInternal {
+            future: Box::pin(async { Box::new(future.await) as _ }),
+            has_value,
+            manual_poll: false,
+            manual_time: None,
+        }));
 
     Coroutine {
-        id: context.coroutines.len() - 1,
+        id,
+        _phantom: PhantomData,
     }
 }
 
 pub fn stop_all_coroutines() {
     let context = &mut get_context().coroutines_context;
 
-    // Cannot clear the vector as there may still be outstanding Coroutines
-    // so their ids would now point into nothingness or later point into
-    // different Coroutines.
-    for future in &mut context.coroutines {
-        *future = None;
-    }
+    context.coroutines.clear();
 }
 
 pub fn stop_coroutine(coroutine: Coroutine) {
     let context = &mut get_context().coroutines_context;
 
-    context.coroutines[coroutine.id] = None;
+    context.coroutines.free(coroutine.id);
 }
 
 pub struct TimerDelayFuture {

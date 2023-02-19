@@ -193,6 +193,21 @@ pub struct EmitterConfig {
     /// Velocity acceleration applied to each particle in the direction of motion.
     pub linear_accel: f32,
 
+    // Initial rotation for each emitted particle.
+    pub initial_rotation: f32,
+    /// Initial rotation randomness.
+    /// Each particle will spawned with "initial_rotation = initial_rotation - initial_rotation * rand::gen_range(0.0, initial_rotation_randomness)".
+    pub initial_rotation_randomness: f32,
+    // Initial rotational speed
+    pub initial_angular_velocity: f32,
+    /// Initial angular velocity randomness.
+    /// Each particle will spawned with "initial_angular_velocity = initial_angular_velocity - initial_angular_velocity * rand::gen_range(0.0, initial_angular_velocity_randomness)".
+    pub initial_angular_velocity_randomness: f32,
+    /// Angular velocity acceleration applied to each particle .
+    pub angular_accel: f32,
+    /// Angluar velocity damping
+    /// Each frame angular velocity will be transformed "angular_velocity *= (1.0 - angular_damping)".
+    pub angular_damping: f32,
     /// Each particle is a "size x size" square.
     pub size: f32,
     /// Each particle will spawned with "size = size - size * rand::gen_range(0.0, size_randomness)".
@@ -254,7 +269,9 @@ pub struct PostProcessing;
 #[derive(Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "nanoserde", derive(DeJson, SerJson))]
 pub enum ParticleShape {
-    Rectangle,
+    Rectangle {
+        aspect_ratio: f32,
+    },
     Circle {
         subdivisions: u32,
     },
@@ -272,14 +289,14 @@ impl ParticleShape {
         texture: Option<Texture2D>,
     ) -> Bindings {
         let (geometry_vertex_buffer, index_buffer) = match self {
-            ParticleShape::Rectangle => {
+            ParticleShape::Rectangle { aspect_ratio } => {
                 #[rustfmt::skip]
                 let vertices: &[f32] = &[
-                    // positions       uv         colors
-                    -1.0, -1.0, 0.0,   0.0, 0.0,  1.0, 1.0, 1.0, 1.0,
-                     1.0, -1.0, 0.0,   1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
-                     1.0,  1.0, 0.0,   1.0, 1.0,  1.0, 1.0, 1.0, 1.0,
-                    -1.0,  1.0, 0.0,   0.0, 1.0,  1.0, 1.0, 1.0, 1.0,
+                    // positions          uv          colors
+                    -1.0 * aspect_ratio, -1.0, 0.0,   0.0, 0.0,  1.0, 1.0, 1.0, 1.0,
+                     1.0 * aspect_ratio, -1.0, 0.0,   1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
+                     1.0 * aspect_ratio,  1.0, 0.0,   1.0, 1.0,  1.0, 1.0, 1.0, 1.0,
+                    -1.0 * aspect_ratio,  1.0, 0.0,   0.0, 1.0,  1.0, 1.0, 1.0, 1.0,
                 ];
 
                 let vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &vertices);
@@ -414,7 +431,7 @@ impl Default for EmitterConfig {
             lifetime: 1.0,
             lifetime_randomness: 0.0,
             amount: 8,
-            shape: ParticleShape::Rectangle,
+            shape: ParticleShape::Rectangle { aspect_ratio: 1.0 },
             explosiveness: 0.0,
             emitting: true,
             initial_direction: vec2(0., -1.),
@@ -422,6 +439,12 @@ impl Default for EmitterConfig {
             initial_velocity: 50.0,
             initial_velocity_randomness: 0.0,
             linear_accel: 0.0,
+            initial_rotation: 0.0,
+            initial_rotation_randomness: 0.0,
+            initial_angular_velocity: 0.0,
+            initial_angular_velocity_randomness: 0.0,
+            angular_accel: 0.0,
+            angular_damping: 0.0,
             size: 10.0,
             size_randomness: 0.0,
             size_curve: None,
@@ -446,6 +469,7 @@ struct GpuParticle {
 
 struct CpuParticle {
     velocity: Vec2,
+    angular_velocity: f32,
     lived: f32,
     lifetime: f32,
     frame: u16,
@@ -488,7 +512,7 @@ impl Emitter {
         let positions_vertex_buffer = Buffer::stream(
             ctx,
             BufferType::VertexBuffer,
-            Self::MAX_PARTICLES * std::mem::size_of::<Vec3>(),
+            Self::MAX_PARTICLES * std::mem::size_of::<GpuParticle>(),
         );
 
         let bindings = config
@@ -539,6 +563,11 @@ impl Emitter {
             shader,
             PipelineParams {
                 color_blend: Some(blend_mode),
+                alpha_blend: Some(BlendState::new(
+                    Equation::Add,
+                    BlendFactor::Zero,
+                    BlendFactor::One,
+                )),
                 ..Default::default()
             },
         );
@@ -657,9 +686,13 @@ impl Emitter {
         let r =
             self.config.size - self.config.size * rand::gen_range(0.0, self.config.size_randomness);
 
+        let rotation = self.config.initial_rotation
+            - self.config.initial_rotation
+                * rand::gen_range(0.0, self.config.initial_rotation_randomness);
+
         let particle = if self.config.local_coords {
             GpuParticle {
-                pos: vec4(offset.x, offset.y, 0.0, r),
+                pos: vec4(offset.x, offset.y, rotation, r),
                 uv: vec4(1.0, 1.0, 0.0, 0.0),
                 data: vec4(self.particles_spawned as f32, 0.0, 0.0, 0.0),
                 color: self.config.colors_curve.start.to_vec(),
@@ -669,7 +702,7 @@ impl Emitter {
                 pos: vec4(
                     self.position.x + offset.x,
                     self.position.y + offset.y,
-                    0.0,
+                    rotation,
                     r,
                 ),
                 uv: vec4(1.0, 1.0, 0.0, 0.0),
@@ -691,6 +724,9 @@ impl Emitter {
                     - self.config.initial_velocity
                         * rand::gen_range(0.0, self.config.initial_velocity_randomness),
             ),
+            angular_velocity: self.config.initial_angular_velocity
+                - self.config.initial_angular_velocity
+                    * rand::gen_range(0.0, self.config.initial_angular_velocity_randomness),
             lived: 0.0,
             lifetime: self.config.lifetime
                 - self.config.lifetime * rand::gen_range(0.0, self.config.lifetime_randomness),
@@ -745,6 +781,8 @@ impl Emitter {
             // TODO: this is not quite the way to apply acceleration, this is not
             // fps independent and just wrong
             cpu.velocity += cpu.velocity * self.config.linear_accel * dt;
+            cpu.angular_velocity += cpu.angular_velocity * self.config.angular_accel * dt;
+            cpu.angular_velocity *= 1.0 - self.config.angular_damping;
 
             gpu.color = {
                 let t = cpu.lived / cpu.lifetime;
@@ -758,7 +796,7 @@ impl Emitter {
                         + self.config.colors_curve.end.to_vec() * t
                 }
             };
-            gpu.pos += vec4(cpu.velocity.x, cpu.velocity.y, 0.0, 0.0) * dt;
+            gpu.pos += vec4(cpu.velocity.x, cpu.velocity.y, cpu.angular_velocity, 0.0) * dt;
 
             gpu.pos.w = cpu.initial_size
                 * self
@@ -770,8 +808,8 @@ impl Emitter {
                 gpu.data.y = cpu.lived / cpu.lifetime;
             }
 
+            //cpu.lived = f32::min(cpu.lived + dt, cpu.lifetime);
             cpu.lived += dt;
-
             cpu.velocity += self.config.gravity * dt;
 
             if let Some(atlas) = &self.config.atlas {
@@ -783,7 +821,7 @@ impl Emitter {
                 }
 
                 let x = cpu.frame % atlas.n;
-                let y = cpu.frame / atlas.m;
+                let y = cpu.frame / atlas.n;
 
                 gpu.uv = vec4(
                     x as f32 / atlas.n as f32,
@@ -799,12 +837,14 @@ impl Emitter {
         for i in (0..self.gpu_particles.len()).rev() {
             // second if clause is just for the case when lifetime was changed in the editor
             // normally particle lifetime is always less or equal config lifetime
-            if self.cpu_counterpart[i].lived > self.cpu_counterpart[i].lifetime
+            if self.cpu_counterpart[i].lived >= self.cpu_counterpart[i].lifetime
                 || self.cpu_counterpart[i].lived > self.config.lifetime
             {
+                if self.cpu_counterpart[i].lived != self.cpu_counterpart[i].lifetime {
+                    self.particles_spawned -= 1;
+                }
                 self.gpu_particles.remove(i);
                 self.cpu_counterpart.remove(i);
-                self.particles_spawned -= 1;
             }
         }
 

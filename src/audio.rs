@@ -20,8 +20,10 @@ mod dummy_audio {
             AudioContext {}
         }
 
+        #[cfg(target_os = "android")]
         pub fn pause(&mut self) {}
 
+        #[cfg(target_os = "android")]
         pub fn resume(&mut self) {}
     }
 
@@ -32,15 +34,17 @@ mod dummy_audio {
             Sound {}
         }
 
-        pub fn is_loaded(&self) -> bool {
-            true
-        }
-
         pub fn play(&mut self, _ctx: &mut AudioContext, _params: PlaySoundParams) {}
 
         pub fn stop(&mut self, _ctx: &mut AudioContext) {}
 
         pub fn set_volume(&mut self, _ctx: &mut AudioContext, _volume: f32) {}
+
+        pub fn is_loaded(&self) -> bool {
+            false
+        }
+
+        pub fn delete(&self, _ctx: &AudioContext) {}
     }
 }
 

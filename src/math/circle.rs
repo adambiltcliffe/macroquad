@@ -43,8 +43,8 @@ impl Circle {
 
     /// Checks whether the `Circle` overlaps a `Rect`
     pub fn overlaps_rect(&self, rect: &Rect) -> bool {
-        let dist_x = (self.x - rect.x).abs();
-        let dist_y = (self.y - rect.y).abs();
+        let dist_x = (self.x - rect.center().x).abs();
+        let dist_y = (self.y - rect.center().y).abs();
         if dist_x > rect.w / 2.0 + self.r || dist_y > rect.h / 2.0 + self.r {
             return false;
         }
@@ -57,7 +57,7 @@ impl Circle {
         return dist_sq <= self.r * self.r;
     }
 
-    /// Translate rect origin by `offset` vector
+    /// Translate `Circle` origin by `offset` vector
     pub fn offset(self, offset: Vec2) -> Circle {
         Circle::new(self.x + offset.x, self.y + offset.y, self.r)
     }

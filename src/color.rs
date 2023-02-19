@@ -79,7 +79,7 @@ impl Color {
     }
 
     /// Build a color from 4 0..255 components
-    /// Unfortunately it may not be const fn due to https://github.com/rust-lang/rust/issues/57241
+    /// Unfortunately it can't be const fn due to https://github.com/rust-lang/rust/issues/57241
     /// When const version is needed "color_u8" macro may be a workaround
     pub fn from_rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
         Color::new(
@@ -88,6 +88,14 @@ impl Color {
             b as f32 / 255.,
             a as f32 / 255.,
         )
+    }
+
+    /// Build a color from a hexadecimal u32
+    /// Example: 0x3CA7D5 - a light blue
+    pub fn from_hex(hex: u32) -> Color {
+        let bytes: [u8; 4] = hex.to_be_bytes();
+
+        Self::from_rgba(bytes[1], bytes[2], bytes[3], 255)
     }
 
     pub fn to_vec(&self) -> glam::Vec4 {
